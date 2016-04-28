@@ -1,0 +1,194 @@
+///////////////////////////////////////////////////////////////////////////
+//
+// Copyright (c) 2015, STEREOLABS.
+//
+// All rights reserved.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+///////////////////////////////////////////////////////////////////////////
+
+
+/****************************************************************************************************
+ ** This sample demonstrates how to grab images and depth map with the ZED SDK in parallel threads **
+ ***************************************************************************************************/
+
+
+//standard includes
+#include <stdio.h>
+#include <string.h>
+#include <ctime>
+#include <chrono>
+#include <thread>
+#include <mutex>
+
+//opencv includes
+#include <opencv2/opencv.hpp>
+
+//ZED Includes
+#include <zed/Camera.hpp>
+#include <zed/utils/GlobalDefine.hpp>
+
+using namespace sl::zed;
+using namespace std;
+
+// Exchange structure
+
+typedef struct image_bufferStruct {
+    unsigned char* data_im;
+    std::mutex mutex_input_image;
+
+    float* data_depth;
+    std::mutex mutex_input_depth;
+
+    int width, height, im_channels;
+} image_buffer;
+
+
+Camera* zed;
+image_buffer* buffer;
+SENSING_MODE dm_type = RAW;
+bool stop_signal;
+int count_run=0;
+bool newFrame=false;
+
+// Grabbing function
+
+void grab_run() {
+    float* p_depth;
+    uchar* p_left;
+
+
+#ifdef __arm__ //only for Jetson K1/X1
+    sl::zed::Camera::sticktoCPUCore(2);
+#endif
+
+
+    while (!stop_signal)
+    {
+ 
+        if (!zed->grab(dm_type,1,1))
+        {
+
+        p_depth = (float*) zed->retrieveMeasure(MEASURE::DEPTH).data; // Get the pointer
+        p_left = zed->retrieveImage(SIDE::LEFT).data; // Get the pointer
+
+        if (count_run%100==0)
+        {
+        std::cout << "* Camera TimeStamp : " << zed->getCameraTimestamp()<< std::endl;
+        long long current_ts = zed->getCurrentTimestamp();
+        std::cout << "* Current TimeStamp : " <<  current_ts << std::endl;
+        }
+
+
+        // Fill the buffer
+        buffer->mutex_input_depth.lock(); // To prevent from data corruption
+        memcpy(buffer->data_depth, p_depth, buffer->width * buffer->height * sizeof (float));
+        buffer->mutex_input_depth.unlock();
+
+        buffer->mutex_input_image.lock();
+        memcpy(buffer->data_im, p_left, buffer->width * buffer->height * buffer->im_channels * sizeof (uchar));
+        buffer->mutex_input_image.unlock();
+ 
+
+        newFrame=true;
+        count_run++;
+        }
+        else
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+int main(int argc, char **argv) {
+    stop_signal = false;
+
+    if (argc > 2) {
+        std::cout << "Only the path of a SVO can be passed in arg" << std::endl;
+        return -1;
+    }
+
+    if (argc == 1) // Use in Live Mode
+        zed = new Camera(HD720,15);
+    else // Use in SVO playback mode
+        zed = new Camera(argv[1]);
+
+    int width = zed->getImageSize().width;
+    int height = zed->getImageSize().height;
+
+    ERRCODE err = zed->init(MODE::PERFORMANCE, -1, true);
+    cout << errcode2str(err) << endl;
+    if (err != SUCCESS) {
+        delete zed;
+        return 1;
+    }
+
+    // allocate data
+    buffer = new image_buffer();
+    buffer->height = height;
+    buffer->width = width;
+    buffer->im_channels = 4;
+    buffer->data_depth = new float[buffer->height * buffer->width];
+    buffer->data_im = new uchar[buffer->height * buffer->width * buffer->im_channels];
+
+    cv::Mat left(height, width, CV_8UC4, buffer->data_im, buffer->width * buffer->im_channels * sizeof (uchar));
+    cv::Mat depth(height, width, CV_32FC1, buffer->data_depth, buffer->width * sizeof (float));
+
+    // Run thread
+    std::thread grab_thread(grab_run);
+    char key = ' ';
+
+	std::cout<<"Press 'q' to exit"<<std::endl;
+
+
+    // loop until 'q' is pressed
+    while (key != 'q') {
+
+        if (newFrame)
+        {
+            newFrame=false; //indicates that we take care of this frame... next frame will be told by the grabbin thread.
+
+ 
+            // Retrieve data from buffer
+            buffer->mutex_input_depth.try_lock();
+            memcpy((float*) depth.data, buffer->data_depth, buffer->width * buffer->height * sizeof (float));
+            buffer->mutex_input_depth.unlock();
+
+            buffer->mutex_input_image.try_lock();
+            memcpy(left.data, buffer->data_im, buffer->width * buffer->height * buffer->im_channels * sizeof (uchar));
+            buffer->mutex_input_image.unlock();
+
+
+            // Do stuff
+            ////
+
+			
+            cv::imshow("Left", left);
+ 
+            key = cv::waitKey(5);
+ 
+        }
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    }
+
+    // Stop the grabbing thread
+    stop_signal = true;
+    grab_thread.join();
+
+    delete[] buffer->data_depth;
+    delete[] buffer->data_im;
+    delete buffer;
+    delete zed;
+    return 0;
+}
